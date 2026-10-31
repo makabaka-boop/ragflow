@@ -31,7 +31,7 @@ import (
 
 func mustParseEML(t *testing.T, reader io.Reader, fields []string) map[string]any {
 	t.Helper()
-	content, err := parseEMLWithError(reader, fields)
+	content, _, _, err := parseEMLWithError(context.Background(), reader, fields, true)
 	if err != nil {
 		t.Fatalf("parseEMLWithError: %v", err)
 	}
@@ -1228,7 +1228,13 @@ func TestReadMailBody_AttachmentPreservesRaw(t *testing.T) {
 	ap.Write([]byte(base64.StdEncoding.EncodeToString(gbk)))
 	mw.Close()
 
-	_, _, attachments := readMailBody(strings.NewReader(buf.String()), "multipart/mixed; boundary="+mw.Boundary(), "", true)
+	reader := &emailBodyReader{cfg: emailBodyConfig{ctx: context.Background(), collectAttachments: true}}
+	reader.walk(strings.NewReader(buf.String()), "multipart/mixed; boundary="+mw.Boundary(), "", nil)
+	result := reader.result()
+	if result.err != nil {
+		t.Fatalf("walk: %v", result.err)
+	}
+	attachments := result.attachments
 	if len(attachments) != 1 {
 		t.Fatalf("expected 1 attachment, got %d: %#v", len(attachments), attachments)
 	}
@@ -1316,7 +1322,7 @@ func TestDecodeMailPayload_DeclaredCharsets(t *testing.T) {
 }
 
 // TestReadMailBody_DeclaredBodyCharsets locks the body-path charset routing
-// exercised end to end by readMailBody (readMailBody → decodeMailPayload →
+// exercised end to end by the email body walk (walk → decodeMailPayload →
 // decodeWithCharset), beyond the direct decodeMailPayload unit above: a
 // gb2312-declared body part decodes its plain 8-bit bytes, and HZ-escaped
 // content decodes under its own "hz-gb-2312" label.
@@ -1331,9 +1337,11 @@ func TestReadMailBody_DeclaredBodyCharsets(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			text, _, _ := readMailBody(strings.NewReader(string(tt.body)), "text/plain; charset="+tt.charset, "", false)
+			reader := &emailBodyReader{cfg: emailBodyConfig{ctx: context.Background()}}
+			reader.walk(strings.NewReader(string(tt.body)), "text/plain; charset="+tt.charset, "", nil)
+			text := reader.result().text
 			if text != "中文" {
-				t.Errorf("readMailBody(charset=%s) = %q, want 中文", tt.charset, text)
+				t.Errorf("body walk(charset=%s) = %q, want 中文", tt.charset, text)
 			}
 		})
 	}

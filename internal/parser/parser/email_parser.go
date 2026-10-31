@@ -26,16 +26,19 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/AkmalOt/gomsg"
 	"go.uber.org/zap"
+	"golang.org/x/net/html"
 	"golang.org/x/text/transform"
 
 	"ragflow/internal/common"
 	charsetlib "ragflow/internal/parser/charset"
+	medialib "ragflow/internal/parser/media"
 	"ragflow/internal/utility"
 )
 
@@ -44,12 +47,22 @@ import (
 // rag/flow/parser/parser.py, whose .msg branch uses extract_msg.
 type EmailParser struct {
 	fields []string
+	// textOnly skips inline (cid-referenced) body images. The text
+	// extraction entry points (previews, attachments, CLI, nested email
+	// re-chunking) run without a run media cache and must never emit images.
+	textOnly bool
 }
 
 var defaultEmailFields = []string{"from", "to", "cc", "bcc", "date", "subject", "body", "attachments", "metadata"}
 
 func NewEmailParser() *EmailParser {
 	return &EmailParser{fields: append([]string(nil), defaultEmailFields...)}
+}
+
+// NewEmailTextParser returns the text-only variant used by readable-text
+// extraction (previews, attachments, CLI) and nested email re-chunking.
+func NewEmailTextParser() *EmailParser {
+	return &EmailParser{fields: append([]string(nil), defaultEmailFields...), textOnly: true}
 }
 
 func (p *EmailParser) ConfigureFromSetup(setup map[string]any) {
@@ -85,6 +98,8 @@ func (p *EmailParser) parseEmail(ctx context.Context, filename string, data []by
 	ext := strings.ToLower(filepath.Ext(filename))
 
 	var content map[string]any
+	var inlineImages []map[string]any
+	var warnings []string
 	if ext == ".msg" {
 		var (
 			msg map[string]any
@@ -110,7 +125,7 @@ func (p *EmailParser) parseEmail(ctx context.Context, filename string, data []by
 		content = msg
 	} else {
 		var err error
-		content, err = parseEMLWithError(bytes.NewReader(data), p.fields)
+		content, inlineImages, warnings, err = parseEMLWithError(ctx, bytes.NewReader(data), p.fields, p.textOnly)
 		if err != nil {
 			return ParseResult{Err: fmt.Errorf("email: .eml: %w", err)}
 		}
@@ -133,10 +148,14 @@ func (p *EmailParser) parseEmail(ctx context.Context, filename string, data []by
 	if headerText := searchableEmailHeaders(content); headerText != "" {
 		items = append(items, NewTextJSONItem(headerText).ToMap())
 	}
+	// Body images belong to the message body, so they follow the main item
+	// (and its header item) ahead of re-chunked attachments.
+	items = append(items, inlineImages...)
 	items = append(items, extraItems...)
 	return ParseResult{
-		File: map[string]any{"name": filename},
-		JSON: MapsToItems(items),
+		File:     map[string]any{"name": filename},
+		JSON:     MapsToItems(items),
+		Warnings: warnings,
 	}
 }
 
@@ -194,13 +213,13 @@ func decodeHeaderWord(val string) string {
 
 // -- .eml parsing (RFC 5322 with multipart support) --
 
-func parseEMLWithError(r io.Reader, fields []string) (map[string]any, error) {
+func parseEMLWithError(ctx context.Context, r io.Reader, fields []string, textOnly bool) (map[string]any, []map[string]any, []string, error) {
 	target := targetFieldsSet(fields)
 	content := map[string]any{}
 
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	// Headers. net/mail does not decode RFC 2047 encoded-words, so decode
@@ -230,71 +249,157 @@ func parseEMLWithError(r io.Reader, fields []string) (map[string]any, error) {
 	// of whether "metadata" is present in the configured fields.
 	content["metadata"] = meta
 
-	// Body and attachments — readMailBody walks all multipart parts
-	// and collects text/html bodies alongside attachment parts whose
-	// Content-Disposition starts with "attachment".
+	// Body and attachments — the emailBodyReader walks all multipart parts,
+	// collects text/html bodies alongside attachment parts whose
+	// Content-Disposition starts with "attachment", and, when "body" is
+	// requested in a non-text-only parse, extracts the inline images the
+	// HTML body references through cid: URLs.
 	needAttachments := target["attachments"]
 	// Attachments are extracted independently of "body" (mirrors the Python
 	// flow parser _email, whose attachment block is separate from the body
 	// block). Walk the body whenever either is requested, then gate each key
 	// by its own field so text/text_html stay absent when "body" is not in
 	// fields while attachments are still extracted when "attachments" is.
+	var inlineImages []map[string]any
+	var warnings []string
 	if target["body"] || needAttachments {
+		reader := &emailBodyReader{
+			cfg: emailBodyConfig{
+				ctx:                ctx,
+				collectAttachments: needAttachments,
+				extractImages:      target["body"] && !textOnly,
+			},
+		}
 		contentType := msg.Header.Get("Content-Type")
 		cte := msg.Header.Get("Content-Transfer-Encoding")
-		bodyText, bodyHTML, attachments := readMailBody(msg.Body, contentType, cte, needAttachments)
+		reader.walk(msg.Body, contentType, cte, nil)
+		result := reader.result()
+		if result.err != nil {
+			return nil, nil, nil, result.err
+		}
 		// Always emit text/text_html when "body" is requested, to match the
 		// Python flow parser contract (rag/flow/parser/parser.py:_email),
 		// which sets both unconditionally (empty string for a missing part)
 		// rather than omitting the key.
 		if target["body"] {
-			content["text"] = bodyText
-			content["text_html"] = bodyHTML
+			content["text"] = result.text
+			content["text_html"] = result.html
 		}
 		if needAttachments {
-			content["attachments"] = attachments
+			content["attachments"] = result.attachments
 		}
+		inlineImages = result.imageItems
+		warnings = result.warnings
 	}
 
-	return content, nil
+	return content, inlineImages, warnings, nil
 }
 
-// readMailBody reads the body of an email message, handling
-// multipart/alternative, multipart/mixed, and single-part content
-// types. Returns (textBody, htmlBody, attachments).
-// When collectAttachments is true, non-text parts with Content-Disposition
-// starting with "attachment" are collected.
-func readMailBody(body io.Reader, contentType, cte string, collectAttachments bool) (string, string, []map[string]any) {
-	var attachments []map[string]any
+// emailBodyConfig controls one email body walk.
+type emailBodyConfig struct {
+	ctx context.Context
+	// collectAttachments gathers parts whose Content-Disposition is
+	// "attachment" independently of inline body images.
+	collectAttachments bool
+	// extractImages opens a Content-ID scope for each multipart/related
+	// container and extracts the image/* parts the group's HTML body
+	// references through cid: URLs.
+	extractImages bool
+}
 
+// emailInlineImage is one image/* MIME part addressable from a
+// multipart/related HTML body through its Content-ID. raw holds the
+// still-CTE-encoded transport bytes; the CTE is validated lazily only for
+// the images the body actually references.
+type emailInlineImage struct {
+	cid  string
+	mime string
+	raw  []byte
+	cte  string
+}
+
+// emailRelatedGroup scopes the Content-ID parts of one multipart/related
+// container. Content-IDs are only meaningful within their group, so two
+// groups may reuse the same id without one group's HTML resolving to the
+// other group's picture.
+type emailRelatedGroup struct {
+	id     int
+	images map[string]*emailInlineImage
+	// html collects the group's HTML parts (possibly nested inside an
+	// alternative container) in walk order.
+	html []string
+}
+
+// emailBodyReader walks an email MIME tree collecting the plain-text and
+// HTML bodies, regular attachments, and — per multipart/related group — the
+// inline images referenced by the group's HTML body.
+type emailBodyReader struct {
+	cfg emailBodyConfig
+
+	textParts   []string
+	htmlParts   []string
+	attachments []map[string]any
+	imageItems  []map[string]any
+
+	budget   *medialib.Budget
+	sink     *medialib.Sink
+	groupSeq int
+	order    int
+
+	// missing counts cid: references with no matching Content-ID part.
+	missing int
+	// corrupt counts referenced parts whose CTE payload fails to decode or
+	// decodes to zero bytes.
+	corrupt int
+	err     error
+}
+
+type emailBodyResult struct {
+	text        string
+	html        string
+	attachments []map[string]any
+	imageItems  []map[string]any
+	warnings    []string
+	err         error
+}
+
+// walk traverses one (possibly multipart) MIME entity. group is the
+// enclosing multipart/related Content-ID scope, or nil outside one.
+func (r *emailBodyReader) walk(body io.Reader, contentType, cte string, group *emailRelatedGroup) {
+	if r.err != nil {
+		return
+	}
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		mediaType = "text/plain"
 	}
 
 	if !strings.HasPrefix(mediaType, "multipart/") {
-		raw, _ := io.ReadAll(body)
-		raw = decodeCTE(raw, cte)
-		decoded := decodeMailPayload(raw, params["charset"])
-		if mediaType == "text/html" {
-			return "", decoded, attachments
-		}
-		return decoded, "", attachments
+		r.readLeaf(body, mediaType, params["charset"], cte)
+		return
 	}
 
 	boundary := params["boundary"]
 	if boundary == "" {
 		raw, _ := io.ReadAll(body)
-		return decodeMailPayload(decodeCTE(raw, cte), ""), "", attachments
+		if decoded := decodeMailPayload(decodeCTE(raw, cte), ""); decoded != "" {
+			r.textParts = append(r.textParts, decoded)
+		}
+		return
+	}
+
+	// A multipart/related container opens a fresh Content-ID scope that
+	// closes once every part (including a nested alternative container) has
+	// been visited. Nested related containers get their own scope.
+	localGroup := group
+	if mediaType == "multipart/related" && r.cfg.extractImages {
+		r.groupSeq++
+		localGroup = &emailRelatedGroup{id: r.groupSeq, images: make(map[string]*emailInlineImage)}
 	}
 
 	mr := multipart.NewReader(body, boundary)
-	var textParts, htmlParts []string
-	for {
+	for r.err == nil {
 		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
 			break
 		}
@@ -304,23 +409,18 @@ func readMailBody(body io.Reader, contentType, cte string, collectAttachments bo
 		if strings.HasPrefix(partMedia, "multipart/") {
 			// RFC 2045 6.4 forbids base64 and quoted-printable on a multipart
 			// entity, so a nested container is never CTE-decoded.
-			t, h, nestedAttachments := readMailBody(part, partCT, "", collectAttachments)
-			if t != "" {
-				textParts = append(textParts, t)
-			}
-			if h != "" {
-				htmlParts = append(htmlParts, h)
-			}
-			attachments = append(attachments, nestedAttachments...)
+			r.walk(part, partCT, "", localGroup)
 			continue
 		}
 
-		// Check if this part is an attachment.
-		if collectAttachments && isAttachmentPart(part) {
+		// A part explicitly marked as an attachment stays a regular
+		// attachment even when it carries a Content-ID inside a related
+		// group.
+		if r.cfg.collectAttachments && isAttachmentPart(part) {
 			raw, _ := io.ReadAll(part)
 			raw = decodeCTE(raw, part.Header.Get("Content-Transfer-Encoding"))
 
-			attachments = append(attachments, map[string]any{
+			r.attachments = append(r.attachments, map[string]any{
 				"filename": attachmentFilename(part),
 				"payload":  decodeMailPayload(raw, partParams["charset"]),
 				// raw preserves the byte-exact decoded-CTE bytes so the
@@ -333,48 +433,280 @@ func readMailBody(body io.Reader, contentType, cte string, collectAttachments bo
 			continue
 		}
 
+		// An inline image part inside a related group is a cid candidate.
+		// Only image/* parts with a Content-ID are registered; unreferenced
+		// parts are never emitted, and a duplicate id keeps the first part
+		// (multipart/related references resolve position-independently).
+		if localGroup != nil && strings.HasPrefix(partMedia, "image/") && r.cfg.extractImages {
+			if cid := emailContentID(part.Header.Get("Content-ID")); cid != "" {
+				if _, exists := localGroup.images[cid]; !exists {
+					raw, _ := io.ReadAll(part)
+					localGroup.images[cid] = &emailInlineImage{
+						cid:  cid,
+						mime: partMedia,
+						raw:  append([]byte(nil), raw...),
+						cte:  part.Header.Get("Content-Transfer-Encoding"),
+					}
+				} else {
+					_, _ = io.Copy(io.Discard, part)
+				}
+				continue
+			}
+		}
+
 		raw, _ := io.ReadAll(part)
 		raw = decodeCTE(raw, part.Header.Get("Content-Transfer-Encoding"))
 		decoded := decodeMailPayload(raw, partParams["charset"])
 
 		switch partMedia {
 		case "text/plain":
-			textParts = append(textParts, decoded)
+			if decoded != "" {
+				r.textParts = append(r.textParts, decoded)
+			}
 		case "text/html":
-			htmlParts = append(htmlParts, decoded)
+			if decoded != "" {
+				r.htmlParts = append(r.htmlParts, decoded)
+				if localGroup != nil {
+					localGroup.html = append(localGroup.html, decoded)
+				}
+			}
 		}
 	}
-	return strings.Join(textParts, "\n"), strings.Join(htmlParts, "\n"), attachments
+
+	if localGroup != group {
+		r.resolveGroup(localGroup)
+	}
 }
 
-// isAttachmentPart checks whether a multipart part should be treated as
-// an attachment (Content-Disposition starts with "attachment"). Mirrors
-// Python's check in _email().
-// decodeCTE decodes Content-Transfer-Encoding (base64, quoted-printable, etc.).
-// Mirrors Python part.get_payload(decode=True).
-func decodeCTE(raw []byte, cte string) []byte {
+// readLeaf handles a non-multipart top-level entity. Every non-HTML body
+// (including text/plain) lands in the text body, matching the historical
+// single-part behavior.
+func (r *emailBodyReader) readLeaf(body io.Reader, mediaType, charset, cte string) {
+	raw, _ := io.ReadAll(body)
+	raw = decodeCTE(raw, cte)
+	decoded := decodeMailPayload(raw, charset)
+	if decoded == "" {
+		return
+	}
+	if mediaType == "text/html" {
+		r.htmlParts = append(r.htmlParts, decoded)
+		return
+	}
+	r.textParts = append(r.textParts, decoded)
+}
+
+// resolveGroup scans the group's HTML bodies for cid: image references and
+// emits each referenced image once, in document order.
+func (r *emailBodyReader) resolveGroup(group *emailRelatedGroup) {
+	if r.err != nil {
+		return
+	}
+	seen := make(map[string]struct{})
+	for _, htmlText := range group.html {
+		for _, ref := range cidImageRefs(htmlText) {
+			if r.err != nil {
+				return
+			}
+			if _, dup := seen[ref.cid]; dup {
+				continue
+			}
+			seen[ref.cid] = struct{}{}
+			part, ok := group.images[ref.cid]
+			if !ok {
+				// The HTML references a Content-ID this group does not
+				// carry; keep parsing the rest of the message.
+				r.missing++
+				continue
+			}
+			r.emitImage(group, part, ref.alt)
+		}
+	}
+}
+
+// emitImage validates one referenced part, admits it through the shared run
+// media budget, and writes it to the run media cache as a ref-only image
+// item. Missing references, unreadable/empty payloads, and media-limit
+// rejections skip the image with a warning instead of failing the message.
+func (r *emailBodyReader) emitImage(group *emailRelatedGroup, part *emailInlineImage, alt string) {
+	data, ok := decodeCTEStrict(part.raw, part.cte)
+	if !ok || len(data) == 0 {
+		r.corrupt++
+		return
+	}
+	sink := r.mediaSink()
+	if sink == nil {
+		return
+	}
+	// The group id in the key keeps same-named Content-IDs in different
+	// related groups from sharing (or cross-resolving) a cached entry.
+	source := fmt.Sprintf("cid:%d:%s", group.id, part.cid)
+	ref, err := sink.Resolve(source, medialib.Size(len(data)), func() (string, []byte, bool) {
+		return part.mime, data, true
+	})
+	if err != nil {
+		r.err = err
+		return
+	}
+	if ref == nil {
+		// Over the per-image/run limits; the budget and sink own the warning.
+		return
+	}
+	r.order++
+	r.imageItems = append(r.imageItems, ImageItem{
+		Text:  strings.TrimSpace(alt),
+		Media: ref,
+		Extra: map[string]any{"media_order": r.order},
+	}.ToMap())
+}
+
+// mediaSink lazily builds the shared run media sink. A full (non-text-only)
+// parse that reaches an inline image without an injected run media cache
+// fails, matching the HTML/EPUB media contract: callers must not silently
+// drop referenced images.
+func (r *emailBodyReader) mediaSink() *medialib.Sink {
+	if r.sink != nil {
+		return r.sink
+	}
+	if medialib.CacheFromContext(r.cfg.ctx) == nil {
+		r.err = fmt.Errorf("email media cache is not configured")
+		return nil
+	}
+	r.budget = medialib.NewBudget()
+	r.sink = medialib.NewSink(r.cfg.ctx, "email", r.budget)
+	return r.sink
+}
+
+func (r *emailBodyReader) result() emailBodyResult {
+	var warnings []string
+	if r.sink != nil {
+		warnings = append(warnings, r.sink.Warnings()...)
+	}
+	if r.missing > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"email parser skipped %d inline image reference(s) without a matching Content-ID part", r.missing))
+	}
+	if r.corrupt > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"email parser skipped %d inline image(s) with a corrupt or empty payload", r.corrupt))
+	}
+	return emailBodyResult{
+		text:        strings.Join(r.textParts, "\n"),
+		html:        strings.Join(r.htmlParts, "\n"),
+		attachments: r.attachments,
+		imageItems:  r.imageItems,
+		warnings:    warnings,
+		err:         r.err,
+	}
+}
+
+// emailCIDRef is one <img src="cid:..."> reference found in an HTML body.
+type emailCIDRef struct {
+	cid string
+	alt string
+}
+
+// cidImageRefs scans an HTML body for <img src="cid:..."> references in
+// document order. Only the cid: scheme is recognized; external http(s),
+// protocol-relative and relative sources are ignored and never fetched. The
+// tokenizer tolerates the malformed markup real-world mailers emit.
+func cidImageRefs(htmlText string) []emailCIDRef {
+	var refs []emailCIDRef
+	tokenizer := html.NewTokenizer(strings.NewReader(htmlText))
+	for {
+		switch tokenizer.Next() {
+		case html.ErrorToken:
+			return refs
+		case html.StartTagToken, html.SelfClosingTagToken:
+			name, _ := tokenizer.TagName()
+			if !strings.EqualFold(string(name), "img") {
+				continue
+			}
+			var src, alt string
+			for {
+				key, val, more := tokenizer.TagAttr()
+				switch strings.ToLower(string(key)) {
+				case "src":
+					src = string(val)
+				case "alt":
+					alt = string(val)
+				}
+				if !more {
+					break
+				}
+			}
+			if cid, ok := parseCIDURL(src); ok {
+				refs = append(refs, emailCIDRef{cid: cid, alt: alt})
+			}
+		}
+	}
+}
+
+// parseCIDURL extracts the bare Content-ID from a cid: URL, as written in
+// an HTML <img src>: the "cid:" prefix, optional angle brackets and percent
+// escapes (RFC 2392) are removed. Matching is case-sensitive and scoped to
+// the enclosing related group, like MIME Content-IDs themselves.
+func parseCIDURL(src string) (string, bool) {
+	src = strings.TrimSpace(src)
+	if len(src) < 4 || !strings.EqualFold(src[:4], "cid:") {
+		return "", false
+	}
+	ref := strings.TrimSpace(src[4:])
+	ref = strings.TrimPrefix(ref, "<")
+	ref = strings.TrimSuffix(ref, ">")
+	if unescaped, err := url.PathUnescape(ref); err == nil {
+		ref = unescaped
+	}
+	ref = strings.TrimSpace(ref)
+	return ref, ref != ""
+}
+
+// emailContentID normalizes a MIME Content-ID header value (typically
+// "<id@host>") into the bare identifier used by cid: references.
+func emailContentID(header string) string {
+	id := strings.TrimSpace(header)
+	id = strings.TrimPrefix(id, "<")
+	id = strings.TrimSuffix(id, ">")
+	return strings.TrimSpace(id)
+}
+
+// decodeCTEStrict decodes a MIME Content-Transfer-Encoding, reporting a
+// failed base64/QP decode instead of returning the raw payload. Unknown
+// encodings and the identity encodings pass the bytes through unchanged.
+func decodeCTEStrict(raw []byte, cte string) ([]byte, bool) {
 	switch strings.ToLower(strings.TrimSpace(cte)) {
+	case "", "7bit", "8bit", "binary":
+		return raw, true
 	case "base64":
 		// Real-world MIME base64 is often line-wrapped (~76 chars per line).
-		// Remove all whitespace before decoding; base64.StdEncoding.DecodeString
-		// strictly rejects interior whitespace.
+		// Remove all line breaks before decoding; base64.StdEncoding strictly
+		// rejects interior whitespace.
 		cleanRaw := bytes.ReplaceAll(raw, []byte("\n"), nil)
 		cleanRaw = bytes.ReplaceAll(cleanRaw, []byte("\r"), nil)
 		d, err := base64.StdEncoding.DecodeString(string(cleanRaw))
 		if err != nil {
-			return raw
+			return nil, false
 		}
-		return d
+		return d, true
 	case "quoted-printable":
-		r := quotedprintable.NewReader(bytes.NewReader(raw))
-		d, err := io.ReadAll(r)
+		d, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(raw)))
 		if err != nil {
-			return raw
+			return nil, false
 		}
-		return d
+		return d, true
 	default:
+		return raw, true
+	}
+}
+
+// decodeCTE decodes Content-Transfer-Encoding leniently for text bodies and
+// attachments, mirroring Python part.get_payload(decode=True): a payload that
+// fails to decode is returned untouched.
+func decodeCTE(raw []byte, cte string) []byte {
+	d, ok := decodeCTEStrict(raw, cte)
+	if !ok {
 		return raw
 	}
+	return d
 }
 
 func isAttachmentPart(part *multipart.Part) bool {
@@ -681,8 +1013,10 @@ func (p *EmailParser) rechunkEmailAttachments(ctx context.Context, content map[s
 			// Reuse the top-level field configuration (including "body") so a
 			// nested .eml/.msg is parsed for its body instead of with a fresh,
 			// unconfigured parser that would only emit metadata and index
-			// garbage.
-			ep := NewEmailParser()
+			// garbage. Nested emails stay text-only: re-chunking has no run
+			// media-cache semantics and their cid images are not part of the
+			// top-level body extraction.
+			ep := NewEmailTextParser()
 			ep.ConfigureFromSetup(map[string]any{"fields": p.fields})
 			res, panicked = recoverParse(func() ParseResult {
 				return ep.parseEmail(ctx, fn, []byte(payload), depth+1)

@@ -87,7 +87,9 @@ func newParser(fileType utility.FileType, textOnly bool) (ParseResultProducer, e
 	case utility.FileTypeJSON:
 		return NewJSONParser(), nil
 	case utility.FileTypeEMAIL:
-		return NewEmailParser(), nil
+		p := NewEmailParser()
+		p.textOnly = textOnly
+		return p, nil
 	case utility.FileTypeVISUAL:
 		return NewPictureParser(), nil
 	case utility.FileTypeAURAL:
