@@ -157,6 +157,7 @@ export const initialParserValues = {
       fileFormat: FileType.PowerPoint,
       parse_method: ParseDocumentType.DeepDOC,
       preprocess: PreprocessValue.main_content,
+      extract_speaker_notes: false,
     },
     // {
     //   fileFormat: FileType.Video,

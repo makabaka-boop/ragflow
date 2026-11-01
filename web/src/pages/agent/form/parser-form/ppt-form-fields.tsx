@@ -4,6 +4,7 @@ import {
   SelectWithSearchFlagOptionType,
 } from '@/components/originui/select-with-search';
 import { RAGFlowFormItem } from '@/components/ragflow-form';
+import { Switch } from '@/components/ui/switch';
 import { isEmpty } from 'lodash';
 import { useEffect, useMemo } from 'react';
 import { useFormContext, useWatch } from 'react-hook-form';
@@ -45,6 +46,10 @@ export function PptFormFields({ prefix }: CommonProps) {
     return (
       !isEmpty(parseMethod) && parseMethod === ParseDocumentType.TCADPParser
     );
+  }, [parseMethod]);
+
+  const deepdocOptionsShown = useMemo(() => {
+    return !isEmpty(parseMethod) && parseMethod === ParseDocumentType.DeepDOC;
   }, [parseMethod]);
 
   // Set default values for TCADP options when TCADP is selected
@@ -110,6 +115,25 @@ export function PptFormFields({ prefix }: CommonProps) {
             )}
           </RAGFlowFormItem>
         </>
+      )}
+      {deepdocOptionsShown && (
+        <RAGFlowFormItem
+          name={buildFieldNameWithPrefix('extract_speaker_notes', prefix)}
+          label={t('flow.extractSpeakerNotes')}
+          tooltip={t('flow.extractSpeakerNotesTip')}
+          horizontal={true}
+          labelClassName="w-full"
+          valueClassName="w-8"
+        >
+          {(field) => (
+            <Switch
+              checked={!!field.value}
+              onCheckedChange={(checked) => {
+                field.onChange?.(checked);
+              }}
+            />
+          )}
+        </RAGFlowFormItem>
       )}
     </>
   );

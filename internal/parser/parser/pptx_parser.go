@@ -38,6 +38,11 @@ type PPTXParser struct {
 	format   string
 	textOnly bool
 
+	// ExtractSpeakerNotes enables on-demand speaker-notes extraction for
+	// OOXML presentations: each slide's notes are appended as a distinct
+	// text item after the slide's content. Defaults to off.
+	ExtractSpeakerNotes bool
+
 	// TCADP cloud-parsing configuration
 	ParseMethod                    string
 	TCADPAPIServer                 string
@@ -74,6 +79,9 @@ func (p *PPTXParser) ConfigureFromSetup(setup map[string]any) {
 	}
 	if v, ok := setup["markdown_image_response_type"].(string); ok {
 		p.TCADPMarkdownImageResponseType = v
+	}
+	if v, ok := setup["extract_speaker_notes"].(bool); ok {
+		p.ExtractSpeakerNotes = v
 	}
 }
 
@@ -166,6 +174,15 @@ func (p *PPTXParser) ParseWithResult(ctx context.Context, filename string, data 
 	if err := ctx.Err(); err != nil {
 		return ParseResult{Err: err}
 	}
+	var noteWarnings []string
+	if p.ExtractSpeakerNotes && effFormat == "pptx" {
+		// Speaker notes live outside the office_oxide IR, so they are read
+		// straight from the OOXML package and appended per slide. Notes are
+		// OOXML-only; the legacy OLE (.ppt) container keeps the normal path.
+		var notes []pptxSlideNotes
+		notes, noteWarnings = extractPPTXSpeakerNotes(data)
+		items = appendPPTXSpeakerNotes(items, notes)
+	}
 	if len(items) == 0 || itemsAllEmpty(items) {
 		// A deck whose IR carries no sections at all, or whose sections
 		// all flatten to empty text (text the IR walker does not cover):
@@ -181,6 +198,6 @@ func (p *PPTXParser) ParseWithResult(ctx context.Context, filename string, data 
 	return ParseResult{
 		File:     map[string]any{"name": filename, "format": effFormat},
 		JSON:     MapsToItems(items),
-		Warnings: sink.warnings(),
+		Warnings: append(sink.warnings(), noteWarnings...),
 	}
 }

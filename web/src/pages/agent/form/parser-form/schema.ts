@@ -28,6 +28,7 @@ export const SetupSchema = z
     enable_multi_column: z.boolean().optional(),
     remove_toc: z.boolean().optional(),
     remove_header_footer: z.boolean().optional(),
+    extract_speaker_notes: z.boolean().optional(),
     pages: z
       .array(
         z

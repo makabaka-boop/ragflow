@@ -3214,6 +3214,9 @@ Tokenizer 会根据所选方式将内容存储为对应的数据结构。`,
       parserMethod: '解析器',
       tableResultType: '表格返回形式',
       markdownImageResponseType: '图片返回形式',
+      extractSpeakerNotes: '提取讲者备注',
+      extractSpeakerNotesTip:
+        '开启后，每页幻灯片的讲者备注会作为独立备注段落追加在该页内容之后并进入切片；缩略图、页码、日期及页眉页脚占位内容不会提取。',
       systemPromptPlaceholder:
         '请输入用于图像分析的系统提示词，若为空则使用系统缺省值',
       exportJson: '导出 JSON',

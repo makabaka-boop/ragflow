@@ -3722,6 +3722,9 @@ The Indexer will store the content in the corresponding data structures for the 
       parserMethod: 'Parser',
       tableResultType: 'Table result type',
       markdownImageResponseType: 'Markdown image response type',
+      extractSpeakerNotes: 'Extract speaker notes',
+      extractSpeakerNotesTip:
+        'Append each slide\u2019s speaker notes as a distinct note paragraph after that slide\u2019s content and include it in chunking. Thumbnails, slide numbers, dates, and header/footer placeholders are excluded.',
       // systemPrompt: 'System Prompt',
       systemPromptPlaceholder:
         'Enter system prompt for image analysis, if empty the system default value will be used',
