@@ -59,17 +59,53 @@ func epubTestHTML(body string) string {
 	return `<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Test</title></head><body>` + body + `</body></html>`
 }
 
-func buildTestEPUB(t *testing.T, chapters []epubTestChapter) []byte {
-	t.Helper()
-	return buildTestEPUBWithImages(t, chapters, nil)
+// epubTestNav describes the EPUB 3 navigation document of a test EPUB.
+type epubTestNav struct {
+	name     string // manifest href, also the ZIP entry under OEBPS/
+	content  string
+	inSpine  bool // add the nav document to the spine as well
+	missing  bool // declared in the manifest but absent from the ZIP
+	declared bool // false omits the manifest item even when content is set
 }
 
-func buildTestEPUBWithImages(t *testing.T, chapters []epubTestChapter, images []epubTestImage) []byte {
+// epubTestOption customizes a test EPUB build.
+type epubTestOption func(*epubTestBuild)
+
+type epubTestBuild struct {
+	nav *epubTestNav
+}
+
+// withEPUB3Nav adds an EPUB 3 navigation document to the test EPUB.
+func withEPUB3Nav(nav epubTestNav) epubTestOption {
+	return func(b *epubTestBuild) {
+		if !nav.declared {
+			nav.declared = true
+		}
+		b.nav = &nav
+	}
+}
+
+func buildTestEPUB(t *testing.T, chapters []epubTestChapter, opts ...epubTestOption) []byte {
 	t.Helper()
+	return buildTestEPUBWithImages(t, chapters, nil, opts...)
+}
+
+func buildTestEPUBWithImages(t *testing.T, chapters []epubTestChapter, images []epubTestImage, opts ...epubTestOption) []byte {
+	t.Helper()
+	cfg := &epubTestBuild{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 	var manifest, spine strings.Builder
 	for i, ch := range chapters {
 		fmt.Fprintf(&manifest, `<item id="c%d" href="%s" media-type="application/xhtml+xml"/>`, i, ch.name)
 		fmt.Fprintf(&spine, `<itemref idref="c%d"/>`, i)
+	}
+	if cfg.nav != nil && cfg.nav.declared {
+		fmt.Fprintf(&manifest, `<item id="nav" href="%s" media-type="application/xhtml+xml" properties="nav"/>`, cfg.nav.name)
+		if cfg.nav.inSpine {
+			spine.WriteString(`<itemref idref="nav"/>`)
+		}
 	}
 	for i, img := range images {
 		href := img.name
@@ -128,6 +164,9 @@ func buildTestEPUBWithImages(t *testing.T, chapters []epubTestChapter, images []
 			write("OEBPS/"+entry, img.content)
 		}
 	}
+	if cfg.nav != nil && cfg.nav.declared && !cfg.nav.missing {
+		write("OEBPS/"+cfg.nav.name, cfg.nav.content)
+	}
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close zip: %v", err)
 	}
@@ -142,6 +181,12 @@ func parseTestEPUB(t *testing.T, chapters []epubTestChapter) ParseResult {
 func parseTestEPUBContext(t *testing.T, ctx context.Context, chapters []epubTestChapter, images []epubTestImage) ParseResult {
 	t.Helper()
 	return NewEPUBParser().ParseWithResult(ctx, "book.epub", buildTestEPUBWithImages(t, chapters, images))
+}
+
+func parseTestEPUB3Nav(t *testing.T, chapters []epubTestChapter, images []epubTestImage, nav epubTestNav) ParseResult {
+	t.Helper()
+	return NewEPUBParser().ParseWithResult(context.Background(), "book.epub",
+		buildTestEPUBWithImages(t, chapters, images, withEPUB3Nav(nav)))
 }
 
 // The run media budget bounds how many distinct ZIP images one EPUB extracts.
@@ -1066,5 +1111,317 @@ func TestEPUBParserPreservesImageOrderAndAlt(t *testing.T) {
 	}
 	if items[3]["doc_type_kwd"] != DocTypeImage || items[3]["text"] != "B" || items[3]["media_order"] != 2 {
 		t.Fatalf("second image = %#v", items[3])
+	}
+}
+
+// --- EPUB 3 navigation document ---
+
+func epubTestNavXHTML(body string) string {
+	return `<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Test</title></head><body>` + body + `</body></html>`
+}
+
+func epubTestNavItems(res ParseResult) []map[string]any {
+	return ItemsToMaps(res.JSON)
+}
+
+func epubItemIndex(items []map[string]any, text string) int {
+	for i, it := range items {
+		if it["text"] == text {
+			return i
+		}
+	}
+	return -1
+}
+
+// The navigation document supplies chapter and in-page section titles with
+// their parent-child levels; body order still follows the spine, and
+// headings split prose at the link target instead of merging sections.
+func TestEPUBParserNavTOCInsertsHierarchicalHeadings(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><h2>Contents</h2><ol>` +
+		`<li><a href="ch1.xhtml">Chapter One</a><ol>` +
+		`<li><a href="ch1.xhtml#sec1">Section One A</a></li>` +
+		`</ol></li>` +
+		`<li><a href="ch2.xhtml#top">Chapter Two</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(
+			`<p>Front matter prose.</p><section id="sec1"><h2>real heading</h2><p>Section body prose.</p></section>`)},
+		{name: "ch2.xhtml", content: epubTestHTML(
+			`<h1 id="top">Two</h1><p>Bravo prose.</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", res.Warnings)
+	}
+	items := epubTestNavItems(res)
+	ch1 := epubItemIndex(items, "# Chapter One")
+	sec := epubItemIndex(items, "## Section One A")
+	ch2 := epubItemIndex(items, "# Chapter Two")
+	if ch1 < 0 || sec < 0 || ch2 < 0 {
+		t.Fatalf("missing nav headings: %#v", items)
+	}
+	for _, idx := range []int{ch1, sec, ch2} {
+		if items[idx]["doc_type_kwd"] != DocTypeText || items[idx]["layout"] != "heading" {
+			t.Fatalf("heading item %d = %#v", idx, items[idx])
+		}
+	}
+	// Spine order: chapter 1 heading and its front prose precede the
+	// in-page section, which precedes chapter 2. Chapter 2's link targets
+	// the in-page <h1 id="top"> anchor, so its title comes after that
+	// chapter's <head> title and before the anchor body.
+	front := epubItemIndex(items, "Test Front matter prose.")
+	sectionBody := epubItemIndex(items, "real heading Section body prose.")
+	title2 := epubItemIndex(items, "Test")
+	bravo := epubItemIndex(items, "Two Bravo prose.")
+	if !(ch1 < front && front < sec && sec < sectionBody &&
+		sectionBody < title2 && title2 < ch2 && ch2 < bravo) {
+		t.Fatalf("heading/body order wrong: ch1=%d front=%d sec=%d body=%d title2=%d ch2=%d bravo=%d\n%#v",
+			ch1, front, sec, sectionBody, title2, ch2, bravo, items)
+	}
+}
+
+// Two nav links with the same title are separate entries emitted at their
+// own link positions rather than deduplicated.
+func TestEPUBParserNavTOCSameNameTitlesDistinguishedByPosition(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml#a">Overview</a></li>` +
+		`<li><a href="ch2.xhtml#b">Overview</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<h2 id="a">A</h2><p>first chapter body</p>`)},
+		{name: "ch2.xhtml", content: epubTestHTML(`<h2 id="b">B</h2><p>second chapter body</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	count := 0
+	for _, it := range epubTestNavItems(res) {
+		if it["text"] == "# Overview" && it["layout"] == "heading" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("same-name heading count = %d, want 2: %#v", count, epubTestNavItems(res))
+	}
+}
+
+// Nav hrefs resolve relative to the navigation document's directory.
+func TestEPUBParserNavTOCResolvesHrefsRelativeToNavDocument(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml#sec1">Section</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "Text/ch1.xhtml", content: epubTestHTML(
+			`<p>before</p><section id="sec1"><p>after anchor</p></section>`)},
+	}, nil, epubTestNav{name: "Text/nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	items := epubTestNavItems(res)
+	heading := epubItemIndex(items, "# Section")
+	before := epubItemIndex(items, "Test before")
+	after := epubItemIndex(items, "after anchor")
+	if heading < 0 || before < 0 || after < 0 || !(before < heading && heading < after) {
+		t.Fatalf("relative nav href not located: %#v", items)
+	}
+}
+
+// Inline and legacy named anchors split the body at paragraph granularity.
+func TestEPUBParserNavTOCLocatesInlineAndNamedAnchors(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml#sec1">By id</a></li>` +
+		`<li><a href="ch1.xhtml#sec2">By name</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(
+			`<p>First paragraph.</p>` +
+				`<p><a id="sec1"></a>Second paragraph.</p>` +
+				`<p><a name="sec2"></a>Third paragraph.</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", res.Warnings)
+	}
+	items := epubTestNavItems(res)
+	i1 := epubItemIndex(items, "# By id")
+	i2 := epubItemIndex(items, "# By name")
+	first := epubItemIndex(items, "Test First paragraph.")
+	second := epubItemIndex(items, "Second paragraph.")
+	third := epubItemIndex(items, "Third paragraph.")
+	if !(first >= 0 && first < i1 && i1 < second && second < i2 && i2 < third) {
+		t.Fatalf("anchor order wrong: first=%d byid=%d second=%d byname=%d third=%d\n%#v",
+			first, i1, second, i2, third, items)
+	}
+}
+
+// A span-headed nav group (EPUB 3.0.1) inherits its first descendant
+// link's position, keeping the parent title above its child.
+func TestEPUBParserNavTOCSpanHeaderInheritsFirstLinkTarget(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><span>Part One</span><ol><li><a href="ch1.xhtml">Chapter One</a></li></ol></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<p>chapter body</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	items := epubTestNavItems(res)
+	part := epubItemIndex(items, "# Part One")
+	chapter := epubItemIndex(items, "## Chapter One")
+	if part < 0 || chapter < 0 || !(part < chapter) {
+		t.Fatalf("span heading missing or out of order: %#v", items)
+	}
+}
+
+// When the nav document is itself a spine item, its TOC link list is
+// navigation chrome and excluded from body, while other prose in the same
+// document is retained.
+func TestEPUBParserNavDocInSpineDropsLinkListKeepsOtherBody(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml">Chapter One</a></li>` +
+		`<li><a href="ch1.xhtml#sec1">Section One A</a></li>` +
+		`</ol></nav><p>Edition notice.</p>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<section id="sec1"><p>chapter body</p></section>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav, inSpine: true})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", res.Warnings)
+	}
+	items := epubTestNavItems(res)
+	var edition, chapterBody string
+	headings := 0
+	for _, it := range items {
+		if it["layout"] == "heading" {
+			headings++
+			switch it["text"] {
+			case "# Chapter One", "# Section One A":
+			default:
+				t.Fatalf("unexpected heading: %#v in %#v", it, items)
+			}
+			continue
+		}
+		text := stringValue(it["text"])
+		if strings.Contains(text, "Contents") ||
+			strings.Contains(text, "Chapter One") ||
+			strings.Contains(text, "Section One A") {
+			t.Fatalf("nav link list leaked into body text: %#v", items)
+		}
+		if strings.Contains(text, "Edition notice.") {
+			edition = text
+		}
+		if strings.Contains(text, "chapter body") {
+			chapterBody = text
+		}
+	}
+	if headings != 2 {
+		t.Fatalf("heading count = %d, want 2 (labels applied to ch1 only): %#v", headings, items)
+	}
+	if edition == "" {
+		t.Fatalf("nav document body lost: %#v", items)
+	}
+	if chapterBody == "" {
+		t.Fatalf("spine chapter body lost: %#v", items)
+	}
+}
+
+// A nav item whose document is missing is a warning and plain spine
+// parsing continues.
+func TestEPUBParserNavDocumentMissingWarnsAndFallsBack(t *testing.T) {
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<p>ALPHA chapter</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", missing: true})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	if !strings.Contains(epubTestText(res), "ALPHA chapter") {
+		t.Fatalf("spine body lost after nav failure: %q", epubTestText(res))
+	}
+	if !strings.Contains(epubTestWarningText(res), "navigation document") {
+		t.Fatalf("missing nav warning: %v", res.Warnings)
+	}
+}
+
+// A readable nav document without a TOC is a warning, not an error.
+func TestEPUBParserNavDocumentWithoutTOCWarnsAndFallsBack(t *testing.T) {
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<p>ALPHA chapter</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: epubTestNavXHTML(`<p>Not a table of contents.</p>`)})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	if !strings.Contains(epubTestText(res), "ALPHA chapter") {
+		t.Fatalf("spine body lost after nav failure: %q", epubTestText(res))
+	}
+	if !strings.Contains(epubTestWarningText(res), "contains no table of contents") {
+		t.Fatalf("missing toc warning: %v", res.Warnings)
+	}
+}
+
+// Links that leave the spine or point at missing anchors are skipped with
+// a warning; the remaining links still split the body and all readable
+// prose is kept.
+func TestEPUBParserNavDropsUnlocatableLinksButKeepsOthers(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml">Chapter One</a></li>` +
+		`<li><a href="ch1.xhtml#missing">Broken anchor</a></li>` +
+		`<li><a href="ch9.xhtml#x">Outside the spine</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(`<p>ALPHA chapter body</p>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	items := epubTestNavItems(res)
+	if epubItemIndex(items, "# Chapter One") < 0 {
+		t.Fatalf("valid nav heading lost: %#v", items)
+	}
+	text := epubTestText(res)
+	if !strings.Contains(text, "ALPHA chapter body") {
+		t.Fatalf("readable body lost: %q", text)
+	}
+	if strings.Contains(text, "Broken anchor") || strings.Contains(text, "Outside the spine") {
+		t.Fatalf("skipped nav titles leaked into body: %q", text)
+	}
+	warnings := epubTestWarningText(res)
+	if !strings.Contains(warnings, `no element with id "missing" in ch1.xhtml`) {
+		t.Fatalf("missing-anchor warning absent: %v", res.Warnings)
+	}
+	if !strings.Contains(warnings, "target is outside the spine reading order") {
+		t.Fatalf("outside-spine warning absent: %v", res.Warnings)
+	}
+}
+
+// Tables keep their structured handling when a nav anchor points at them:
+// the heading precedes the table item.
+func TestEPUBParserNavAnchorBeforeTableKeepsTableItem(t *testing.T) {
+	nav := epubTestNavXHTML(`<nav epub:type="toc"><ol>` +
+		`<li><a href="ch1.xhtml#t">Table section</a></li>` +
+		`</ol></nav>`)
+	res := parseTestEPUB3Nav(t, []epubTestChapter{
+		{name: "ch1.xhtml", content: epubTestHTML(
+			`<section id="t"><table><tr><td>Owner</td><td>RET</td></tr></table></section>`)},
+	}, nil, epubTestNav{name: "nav.xhtml", content: nav})
+	if res.Err != nil {
+		t.Fatalf("ParseWithResult: %v", res.Err)
+	}
+	items := epubTestNavItems(res)
+	heading := epubItemIndex(items, "# Table section")
+	table := -1
+	for i, it := range items {
+		if it["doc_type_kwd"] == DocTypeTable {
+			table = i
+		}
+	}
+	if heading < 0 || table < 0 || !(heading < table) {
+		t.Fatalf("heading=%d table=%d items=%#v", heading, table, items)
 	}
 }
